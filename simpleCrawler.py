@@ -1,7 +1,6 @@
 import requests
 import pickle
 import os
-import time
 import unittest
 from bs4 import BeautifulSoup
 from dataclasses import dataclass, field
