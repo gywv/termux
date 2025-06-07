@@ -1,138 +1,130 @@
-import requests
-import pickle
-import os
-import unittest
+import asyncio
+import aiohttp
+import json
 from bs4 import BeautifulSoup
-from dataclasses import dataclass, field
-from typing import Set, List, Optional
+from urllib.parse import urljoin, urlparse
+import time
+from typing import Set, List, Dict
+import re
 
-
-DATA_FILE = 'crawler_state.data'
-
-# -------------------------
-# 📦 结构定义
-# -------------------------
-@dataclass
-class CrawlResult:
-    url: str
-    title: str
-
-@dataclass
-class CrawlerState:
-    to_visit: Set[str] = field(default_factory=set)
-    visited: Set[str] = field(default_factory=set)
-    results: List[CrawlResult] = field(default_factory=list)
-
-
-# -------------------------
-# 🕷️ 爬虫类
-# -------------------------
-class SimpleCrawler:
-    def __init__(self, start_urls):
-        self.state = CrawlerState(set(start_urls))
-        self.load_state()
-
-    def fetch(self, url: str) -> Optional[str]:
+class AsyncCrawler:
+    def __init__(self, start_url: str, domain: str, max_pages: int = 100, timeout: int = 3):
+        self.start_url = start_url
+        self.domain = domain
+        self.max_pages = max_pages
+        self.timeout = timeout
+        
+        self.visited_urls: Set[str] = set()
+        self.results: List[Dict] = []
+        self.total_pages = 0
+        self.start_time = 0
+        
+    def normalize_url(self, url: str) -> str:
+        """移除锚点,标准化URL"""
+        return url.split('#')[0]
+    
+    def is_valid_url(self, url: str) -> bool:
+        """检查URL是否合法且在目标域名下"""
         try:
-            print(f"Crawling: {url}")
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, timeout=10)
-            response.raise_for_status()
-            return response.text
+            parsed = urlparse(url)
+            return parsed.netloc == urlparse(self.domain).netloc
+        except:
+            return False
+            
+    async def fetch_page(self, session: aiohttp.ClientSession, url: str) -> Dict:
+        """抓取单个页面"""
+        try:
+            async with session.get(url, timeout=self.timeout) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+                    
+                    # 提取标题
+                    title = soup.title.string if soup.title else ''
+                    
+                    # 提取纯文本
+                    texts = soup.stripped_strings
+                    text_content = ' '.join(text for text in texts)
+                    
+                    # 提取链接
+                    links = []
+                    for a in soup.find_all('a', href=True):
+                        link = urljoin(url, a['href'])
+                        if self.is_valid_url(link):
+                            links.append(self.normalize_url(link))
+                    
+                    return {
+                        'url': url,
+                        'title': title,
+                        'text': text_content,
+                        'links': links
+                    }
         except Exception as e:
-            print(f"Error fetching {url}: {e}")
-            return None
-
-    def parse(self, html: str, url: str) -> (CrawlResult, Set[str]):
-        soup = BeautifulSoup(html, 'html.parser')
-        title = soup.title.string.strip() if soup.title else 'No Title'
-        return CrawlResult(url=url, title=title), set()
-
-    def crawl(self, max_pages=100):
-        while self.state.to_visit and len(self.state.visited) < max_pages:
-            url = self.state.to_visit.pop()
-            if url in self.state.visited:
-                continue
-
-            html = self.fetch(url)
-            if html:
-                result, new_links = self.parse(html, url)
-                self.state.results.append(result)
-                self.state.visited.add(url)
-                self.state.to_visit.update(new_links - self.state.visited)
-
-            self.save_state()
-
-
-    def save_state(self):
-        with open(DATA_FILE, 'wb') as f:
-            pickle.dump(self.state, f)
-        print(f"✅ State saved. Visited: {len(self.state.visited)}")
-
-    def load_state(self):
-        if os.path.exists(DATA_FILE):
-            with open(DATA_FILE, 'rb') as f:
-                self.state = pickle.load(f)
-            print(f"🔄 State loaded. Resuming from visited: {len(self.state.visited)}")
-        else:
-            print("🆕 No previous state found. Starting fresh.")
-
-
-# -------------------------
-# 🔍 查询接口类
-# -------------------------
-class ResultQuery:
-    def __init__(self, data_file=DATA_FILE):
-        self.state: CrawlerState = self.load_state(data_file)
-
-    def load_state(self, file_path: str) -> CrawlerState:
-        if os.path.exists(file_path):
-            with open(file_path, 'rb') as f:
-                return pickle.load(f)
-        else:
-            raise FileNotFoundError(f"Data file {file_path} not found.")
-
-    def search_by_title_keyword(self, keyword: str) -> List[CrawlResult]:
-        return [item for item in self.state.results if keyword.lower() in item.title.lower()]
-
-    def search_by_url(self, url: str) -> Optional[CrawlResult]:
-        for item in self.state.results:
-            if item.url == url:
-                return item
+            print(f"Error fetching {url}: {str(e)}")
         return None
 
-    def all_results(self) -> List[CrawlResult]:
-        return self.state.results
+    async def crawl(self):
+        """主爬虫逻辑"""
+        self.start_time = time.time()
+        
+        async with aiohttp.ClientSession() as session:
+            # 初始化任务队列
+            queue = asyncio.Queue()
+            await queue.put(self.start_url)
+            
+            while not queue.empty() and self.total_pages < self.max_pages:
+                # 获取当前队列中的所有URL
+                current_urls = []
+                try:
+                    while not queue.empty() and len(current_urls) < self.max_pages - self.total_pages:
+                        url = await queue.get()
+                        if self.normalize_url(url) not in self.visited_urls:
+                            current_urls.append(url)
+                except asyncio.QueueEmpty:
+                    pass
+                
+                if not current_urls:
+                    break
+                    
+                # 并发抓取页面
+                tasks = [self.fetch_page(session, url) for url in current_urls]
+                results = await asyncio.gather(*tasks)
+                
+                # 处理结果
+                for result in results:
+                    if result:
+                        self.visited_urls.add(self.normalize_url(result['url']))
+                        self.results.append({
+                            'url': result['url'],
+                            'title': result['title'],
+                            'text': result['text']
+                        })
+                        self.total_pages += 1
+                        
+                        # 将新链接加入队列
+                        for link in result['links']:
+                            if self.normalize_url(link) not in self.visited_urls:
+                                await queue.put(link)
+                                
+        # 计算统计信息
+        duration = time.time() - self.start_time
+        pages_per_second = self.total_pages / duration
+        print(f"\nCrawling completed:")
+        print(f"Total pages: {self.total_pages}")
+        print(f"Time taken: {duration:.2f} seconds")
+        print(f"Speed: {pages_per_second:.2f} pages/second")
+        
+    def save_results(self, filename: str = 'crawler_results.json'):
+        """保存结果到JSON文件"""
+        with open(filename, 'w', encoding='utf-8') as f:
+            json.dump(self.results, f, ensure_ascii=False, indent=2)
 
+async def main():
+    start_url = 'https://blog.bling.moe/tags/软路由/'
+    domain = 'https://blog.bling.moe'
+    crawler = AsyncCrawler(start_url, domain)
+    await crawler.crawl()
+    crawler.save_results()
 
-# -------------------------
-# ✅ 测试类
-# -------------------------
-class TestCrawlerAndQuery(unittest.TestCase):
-    def test_crawling_and_query(self):
-        # Step 1: Run the crawler
-        seed_urls = ['https://example.com']
-        crawler = SimpleCrawler(seed_urls)
-        crawler.crawl(max_pages=1)  # 限制页面数便于测试
-
-        # Step 2: Query results
-        query = ResultQuery()
-
-        print("\n🔍 Results with keyword 'Example':")
-        results = query.search_by_title_keyword('Example')
-        for result in results:
-            print(result)
-        self.assertTrue(any('Example' in r.title for r in results))
-
-        print("\n🔗 Search by URL:")
-        result = query.search_by_url('https://example.com')
-        print(result)
-        self.assertIsNotNone(result)
-        self.assertEqual(result.url, 'https://example.com')
-
-
-# -------------------------
-# 🏁 启动测试
-# -------------------------
-if __name__ == "__main__":
-    unittest.main()
+if __name__ == '__main__':
+    asyncio.run(main())
